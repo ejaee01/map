@@ -22,6 +22,20 @@ WHAT'S DIFFERENT FROM THE DESKTOP VERSION
   at a time and the map view re-centers on it every time.
 - Optional live GPS auto-advance via gpsd, with automatic fallback to
   manual Next/Prev stepping if no GPS hardware/daemon is present.
+- Automatic rerouting: if a GPS fix shows you've drifted off the planned
+  route (missed a turn, detour, etc.), it recomputes a fresh route from
+  where you are to the destination and rebuilds the light/turn list.
+- Manual rerouting when there's no GPS: the same Left/Right arrow keys
+  (or on-screen Prev/Next buttons - handy for wiring up physical arrow
+  buttons on a dashboard) let you walk forward/back to whichever event
+  matches where you actually are, then "Reroute From Here" recomputes
+  the route from that arrow-selected position to the destination.
+- Offline map tiles: OSM tiles for the current route are cached to a local
+  SQLite file as soon as a route is found, and the map view reads from
+  that cache first - so the map keeps working with no data connection.
+  A "Download Offline Maps" button lets you pre-cache a route (e.g. on
+  home Wi-Fi before a drive), and `--offline` forces cache-only mode with
+  zero network tile requests.
 
 RASPBERRY PI 5 SETUP
 --------------------------------------------------------------------------------
@@ -54,12 +68,23 @@ RASPBERRY PI 5 SETUP
      python3 mainpi.py                 # auto-detects screen size
      python3 mainpi.py --fullscreen    # force kiosk mode
      python3 mainpi.py --windowed      # force a normal window
+     python3 mainpi.py --offline       # use only cached map tiles, no tile
+                                        # network requests at all
+     python3 mainpi.py --tile-cache /path/to/tiles.db   # custom cache file
 
 7. OPTIONAL - launch on boot (e.g. a kiosk box mounted in a car): add a
    .desktop entry under ~/.config/autostart/ that runs
    `python3 /home/pi/mymap/mainpi.py --fullscreen`.
 
+Offline map tiles live in ~/.mymap_pi/offline_tiles.db by default. Once a
+route has been cached (automatically, or via "Download Offline Maps" on the
+route screen), that area keeps working with no signal.
+
 Press F11 to toggle fullscreen at any time, Escape to leave fullscreen.
+While on the Navigation screen, the Left/Right arrow keys step to the
+previous/next light or turn - the same as the on-screen Prev/Next buttons -
+which is convenient if you wire up physical arrow buttons/a keypad on a
+dashboard build.
 ================================================================================
 """
 
@@ -81,9 +106,11 @@ from geopy.geocoders import Nominatim
 
 try:
     import tkintermapview
+    from tkintermapview import OfflineLoader
     TKINTERMAPVIEW_AVAILABLE = True
 except ImportError:
     tkintermapview = None
+    OfflineLoader = None
     TKINTERMAPVIEW_AVAILABLE = False
 
 try:
@@ -92,6 +119,20 @@ try:
 except ImportError:
     gpsd = None
     GPSD_MODULE_AVAILABLE = False
+
+
+# Where cached offline map tiles are stored by default (override with --tile-cache).
+DEFAULT_TILE_DB = str(Path.home() / ".mymap_pi" / "offline_tiles.db")
+try:
+    Path(DEFAULT_TILE_DB).parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+# Off-route / rerouting tuning.
+OFF_ROUTE_THRESHOLD_M = 60.0       # how far from the route path counts as "off route"
+OFF_ROUTE_STREAK_REQUIRED = 3      # consecutive off-route fixes needed before rerouting (avoids GPS jitter)
+MIN_REROUTE_INTERVAL_S = 20.0      # don't re-trigger a reroute more often than this
+ARRIVAL_RADIUS_M = 40.0            # how close counts as "reached" the next light/turn
 
 
 # ============================================================================
@@ -167,6 +208,36 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _project_m(lat0: float, lon0: float, lat: float, lon: float) -> Tuple[float, float]:
+    """Flat-earth (lat0, lon0) as the origin projection, in meters. Accurate enough
+    for the short distances involved in off-route detection."""
+    R = 6371000.0
+    x = math.radians(lon - lon0) * math.cos(math.radians(lat0)) * R
+    y = math.radians(lat - lat0) * R
+    return x, y
+
+
+def distance_to_route_m(lat: float, lon: float, waypoints: List[Tuple[float, float]]) -> float:
+    """Shortest distance (meters) from a point to the route's polyline."""
+    if len(waypoints) < 2:
+        return float("inf")
+    best = float("inf")
+    for i in range(len(waypoints) - 1):
+        lat1, lon1 = waypoints[i]
+        lat2, lon2 = waypoints[i + 1]
+        x1, y1 = _project_m(lat, lon, lat1, lon1)
+        x2, y2 = _project_m(lat, lon, lat2, lon2)
+        dx, dy = x2 - x1, y2 - y1
+        seg_len_sq = dx * dx + dy * dy
+        t = 0.0 if seg_len_sq < 1e-6 else max(0.0, min(1.0, (-x1 * dx - y1 * dy) / seg_len_sq))
+        closest_x = x1 + t * dx
+        closest_y = y1 + t * dy
+        d = math.hypot(closest_x, closest_y)
+        if d < best:
+            best = d
+    return best
 
 
 def simplify_points(points: List[Tuple[float, float]], max_points: int = 120) -> List[Tuple[float, float]]:
@@ -636,6 +707,40 @@ class FuelCalculator:
 
 
 # ============================================================================
+# OFFLINE MAP TILES
+# ============================================================================
+
+def precache_route_tiles(route: "Route", db_path: str, zoom_min: int = 12, zoom_max: int = 16,
+                          pad_deg: float = 0.02, progress_cb=None) -> bool:
+    """
+    Best-effort background download of OSM tiles covering the route's bounding
+    box (plus a little padding) into a local SQLite cache, so the map view
+    keeps working with no data connection. Safe to call repeatedly - already
+    cached tiles/sections are skipped. Blocking, so always call from a thread.
+    """
+    if not TKINTERMAPVIEW_AVAILABLE or OfflineLoader is None or not route.waypoints:
+        return False
+    try:
+        lats = [p[0] for p in route.waypoints]
+        lons = [p[1] for p in route.waypoints]
+        top_left = (max(lats) + pad_deg, min(lons) - pad_deg)
+        bottom_right = (min(lats) - pad_deg, max(lons) + pad_deg)
+
+        if progress_cb:
+            progress_cb(f"Offline maps: downloading tiles (zoom {zoom_min}-{zoom_max})...")
+        loader = OfflineLoader(path=db_path, max_zoom=zoom_max)
+        loader.save_offline_tiles(top_left, bottom_right, zoom_min, zoom_max)
+        if progress_cb:
+            progress_cb("Offline maps: cached for this route")
+        return True
+    except Exception as e:
+        print(f"Offline tile caching error: {e}")
+        if progress_cb:
+            progress_cb("Offline maps: caching failed (check network)")
+        return False
+
+
+# ============================================================================
 # NAV EVENTS: merge every turn + every traffic light into one ordered list
 # ============================================================================
 
@@ -744,9 +849,16 @@ class GPSProvider:
 class NavigationApp(tk.Tk):
     """Multi-screen navigation app, scaled and adapted for a Raspberry Pi 5."""
 
-    def __init__(self, force_fullscreen: Optional[bool] = None):
+    def __init__(self, force_fullscreen: Optional[bool] = None, offline_mode: bool = False,
+                 tile_db_path: str = DEFAULT_TILE_DB):
         super().__init__()
         self.title("MyMap - Raspberry Pi Navigation")
+
+        self.offline_mode = offline_mode
+        self.tile_db_path = tile_db_path
+        self.offline_status_var = tk.StringVar(
+            value="Offline maps: cache-only mode" if offline_mode else "Offline maps: not cached yet"
+        )
 
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
@@ -780,6 +892,10 @@ class NavigationApp(tk.Tk):
         self.end_location: Optional[Location] = None
         self.start_search_timer = None
         self.end_search_timer = None
+        self.active_screen_name = "search"
+
+        self.bind("<Left>", self._on_global_left)
+        self.bind("<Right>", self._on_global_right)
 
         self.container = tk.Frame(self)
         self.container.pack(side="top", fill="both", expand=True)
@@ -800,7 +916,19 @@ class NavigationApp(tk.Tk):
         for frame in self.frames.values():
             frame.grid(row=0, column=0, sticky="nsew")
 
+    def _on_global_left(self, event):
+        """Left arrow -> Prev, only while the navigation screen is showing.
+        Lets a physical arrow button/keypad drive the app with no GPS."""
+        if self.active_screen_name == "navigation":
+            self.frames["navigation"]._on_prev()
+
+    def _on_global_right(self, event):
+        """Right arrow -> Next, only while the navigation screen is showing."""
+        if self.active_screen_name == "navigation":
+            self.frames["navigation"]._on_next()
+
     def _show_screen(self, screen_name: str):
+        self.active_screen_name = screen_name
         frame = self.frames[screen_name]
         frame.tkraise()
         if hasattr(frame, "on_show"):
@@ -946,6 +1074,18 @@ class SearchScreen(tk.Frame):
         self.app.run_on_ui_thread(self.find_btn.config, state=tk.NORMAL)
         self.app.run_on_ui_thread(self.app._show_screen, "routes")
 
+        # Best-effort: start caching this route's map tiles offline right away,
+        # so the map still works if you lose signal during the drive.
+        if not self.app.offline_mode:
+            def cache_progress(msg):
+                self.app.run_on_ui_thread(self.app.offline_status_var.set, msg)
+            threading.Thread(
+                target=precache_route_tiles,
+                args=(route, self.app.tile_db_path, 12, 16),
+                kwargs={"progress_cb": cache_progress},
+                daemon=True,
+            ).start()
+
 
 # ============================================================================
 # SCREEN: ROUTE OVERVIEW
@@ -974,11 +1114,21 @@ class RoutesScreen(tk.Frame):
         self.map_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         if TKINTERMAPVIEW_AVAILABLE:
-            self.map_widget = tkintermapview.TkinterMapView(self.map_frame, width=800, height=500)
+            self.map_widget = tkintermapview.TkinterMapView(
+                self.map_frame, width=800, height=500,
+                database_path=self.app.tile_db_path, use_database_only=self.app.offline_mode,
+            )
             self.map_widget.pack(fill=tk.BOTH, expand=True)
         else:
             tk.Label(self.map_frame, text="Install tkintermapview to see the map:\npip install tkintermapview",
                      font=("Arial", int(10 * s)), fg="blue").pack(fill=tk.BOTH, expand=True)
+
+        offline_row = tk.Frame(self, bg="white")
+        offline_row.pack(fill=tk.X, padx=10)
+        tk.Label(offline_row, textvariable=self.app.offline_status_var, font=("Arial", int(9 * s)),
+                 fg="#5f6368", bg="white").pack(side=tk.LEFT)
+        tk.Button(offline_row, text="Download Offline Maps", command=self._on_download_offline,
+                  font=("Arial", int(9 * s))).pack(side=tk.RIGHT, pady=4)
 
         self.start_btn = tk.Button(self, text="Start Navigation", command=self._on_start_navigation,
                                     bg="#34a853", fg="white", font=("Arial", int(13 * s), "bold"), height=2, relief=tk.FLAT)
@@ -992,6 +1142,21 @@ class RoutesScreen(tk.Frame):
                      f"{route.turns} turns  |  {route.traffic_signals} lights"
             )
         self._draw_map()
+
+    def _on_download_offline(self):
+        """Manually (re)trigger offline tile caching for the current route,
+        at a slightly higher max zoom than the automatic background pass."""
+        route = self.app.current_route
+        if not route:
+            return
+        def cache_progress(msg):
+            self.app.run_on_ui_thread(self.app.offline_status_var.set, msg)
+        threading.Thread(
+            target=precache_route_tiles,
+            args=(route, self.app.tile_db_path, 12, 17),
+            kwargs={"progress_cb": cache_progress},
+            daemon=True,
+        ).start()
 
     def _draw_map(self):
         if not TKINTERMAPVIEW_AVAILABLE or not self.map_widget:
@@ -1038,6 +1203,9 @@ class NavigationScreen(tk.Frame):
         super().__init__(parent, bg="white")
         self.app = app
         self.map_widget = None
+        self._rerouting = False
+        self._off_route_streak = 0
+        self._last_reroute_time = 0.0
         self._build_ui()
 
     def _build_ui(self):
@@ -1055,10 +1223,16 @@ class NavigationScreen(tk.Frame):
         map_frame = tk.Frame(body, bg="white")
         map_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
         if TKINTERMAPVIEW_AVAILABLE:
-            self.map_widget = tkintermapview.TkinterMapView(map_frame, width=520, height=440)
+            self.map_widget = tkintermapview.TkinterMapView(
+                map_frame, width=520, height=440,
+                database_path=self.app.tile_db_path, use_database_only=self.app.offline_mode,
+            )
             self.map_widget.pack(fill=tk.BOTH, expand=True)
         else:
             tk.Label(map_frame, text="Install tkintermapview to see the map.", font=("Arial", int(10 * s))).pack(fill=tk.BOTH, expand=True)
+
+        self.reroute_status = tk.Label(map_frame, text="", font=("Arial", int(9 * s), "bold"), bg="white", fg="#5f6368")
+        self.reroute_status.pack(fill=tk.X, pady=(4, 0))
 
         side_w = int(300 * s)
         side = tk.Frame(body, bg="white", width=side_w)
@@ -1087,6 +1261,15 @@ class NavigationScreen(tk.Frame):
         self.next_btn = tk.Button(btn_row, text="Next \u25b6", font=("Arial", int(12 * s), "bold"),
                                    height=2, bg="#c8f7d0", command=self._on_next)
         self.next_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+
+        tk.Label(side, text="(Left/Right keys also work - handy for physical buttons)",
+                 font=("Arial", int(8 * s)), fg="#9aa0a6", bg="white").pack()
+
+        self.reroute_btn = tk.Button(side, text="\u21bb Reroute From Here", font=("Arial", int(11 * s), "bold"),
+                                      height=2, bg="#fff0c2", command=self._on_manual_reroute)
+        self.reroute_btn.pack(pady=(8, 4), fill=tk.X)
+        tk.Label(side, text="No GPS? Use Prev/Next to walk to where you\nactually are, then tap this to recalculate.",
+                 font=("Arial", int(8 * s)), fg="#9aa0a6", bg="white", justify="center").pack()
 
         fuel_frame = tk.Frame(side, bg="white")
         fuel_frame.pack(pady=6)
@@ -1117,12 +1300,27 @@ class NavigationScreen(tk.Frame):
             self.gps_status.config(text="Manual mode (no GPS)", fg="#ffcc00")
 
     def _on_gps_fix(self, lat, lon):
+        route = self.app.current_route
         events = self.app.nav_events
+        if not route or not events:
+            return
+
+        # Off-route detection -> automatic reroute (skipped while a reroute is
+        # already in flight, and rate-limited so a single bad fix can't spam OSRM).
+        if not self._rerouting:
+            off_route = distance_to_route_m(lat, lon, route.waypoints) > OFF_ROUTE_THRESHOLD_M
+            self._off_route_streak = self._off_route_streak + 1 if off_route else 0
+            if (self._off_route_streak >= OFF_ROUTE_STREAK_REQUIRED
+                    and time.time() - self._last_reroute_time > MIN_REROUTE_INTERVAL_S):
+                self._off_route_streak = 0
+                self.app.run_on_ui_thread(self._trigger_reroute, lat, lon, "you're off the planned route")
+                return
+
         idx = self.app.current_event_index
         if idx >= len(events):
             return
         target = events[idx]
-        if haversine_m(lat, lon, target.lat, target.lon) < 40:
+        if haversine_m(lat, lon, target.lat, target.lon) < ARRIVAL_RADIUS_M:
             self.app.run_on_ui_thread(self._advance_from_gps)
 
     def _advance_from_gps(self):
@@ -1130,6 +1328,56 @@ class NavigationScreen(tk.Frame):
             self.app.current_event_index += 1
             self._update_display()
             self._draw_map()
+
+    def _on_manual_reroute(self):
+        """No GPS? Use wherever the Prev/Next arrows have navigated to as
+        'where I actually am' and recompute the route from there."""
+        events = self.app.nav_events
+        idx = self.app.current_event_index
+        if self.app.gps.available and self.app.gps.lat is not None and self.app.gps.lon is not None:
+            lat, lon, reason = self.app.gps.lat, self.app.gps.lon, "manual reroute from GPS position"
+        elif events and idx < len(events):
+            lat, lon, reason = events[idx].lat, events[idx].lon, "manual reroute from arrow position"
+        elif self.app.start_location:
+            lat, lon, reason = self.app.start_location.lat, self.app.start_location.lon, "manual reroute from start"
+        else:
+            return
+        self._trigger_reroute(lat, lon, reason)
+
+    def _trigger_reroute(self, from_lat: float, from_lon: float, reason: str):
+        if self._rerouting or not self.app.end_location:
+            return
+        self._rerouting = True
+        self._last_reroute_time = time.time()
+        self.reroute_status.config(text=f"Rerouting ({reason})...", fg="#b06000")
+        threading.Thread(target=self._reroute_worker, args=(from_lat, from_lon, reason), daemon=True).start()
+
+    def _reroute_worker(self, from_lat: float, from_lon: float, reason: str):
+        origin = Location(name="Current position", lat=from_lat, lon=from_lon)
+        new_route = self.app.routing_engine.compute_route(origin, self.app.end_location)
+        self.app.run_on_ui_thread(self._apply_reroute, new_route, reason)
+
+    def _apply_reroute(self, new_route: Optional[Route], reason: str):
+        self._rerouting = False
+        if not new_route:
+            self.reroute_status.config(text="Reroute failed - keeping current route", fg="#c5221f")
+            return
+        self.app.current_route = new_route
+        self.app.nav_events = build_nav_events(new_route)
+        self.app.current_event_index = 0
+        self.reroute_status.config(text=f"Rerouted ({reason})", fg="#188038")
+        self._update_display()
+        self._draw_map()
+
+        if not self.app.offline_mode:
+            def cache_progress(msg):
+                self.app.run_on_ui_thread(self.app.offline_status_var.set, msg)
+            threading.Thread(
+                target=precache_route_tiles,
+                args=(new_route, self.app.tile_db_path, 12, 16),
+                kwargs={"progress_cb": cache_progress},
+                daemon=True,
+            ).start()
 
     def _current_progress_m(self) -> float:
         events = self.app.nav_events
@@ -1269,6 +1517,10 @@ def main():
     parser = argparse.ArgumentParser(description="MyMap navigation for Raspberry Pi 5")
     parser.add_argument("--fullscreen", action="store_true", help="Force fullscreen kiosk mode")
     parser.add_argument("--windowed", action="store_true", help="Force a normal window")
+    parser.add_argument("--offline", action="store_true",
+                         help="Use only cached map tiles (no tile network requests at all)")
+    parser.add_argument("--tile-cache", default=DEFAULT_TILE_DB, metavar="PATH",
+                         help=f"Path to the offline tile cache database (default: {DEFAULT_TILE_DB})")
     args = parser.parse_args()
 
     _check_display()
@@ -1279,7 +1531,7 @@ def main():
 
     force_fullscreen = True if args.fullscreen else (False if args.windowed else None)
 
-    app = NavigationApp(force_fullscreen=force_fullscreen)
+    app = NavigationApp(force_fullscreen=force_fullscreen, offline_mode=args.offline, tile_db_path=args.tile_cache)
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
 
